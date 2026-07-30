@@ -1,6 +1,6 @@
 //! The `share` subcommand: a CLI client that plays the browser tab's role
 //! from src/index.html, but for one local file. Connects to a running
-//! directshare server, offers the file, and answers pulls straight off
+//! p2p-autos server, offers the file, and answers pulls straight off
 //! disk. The link only works while this process is running — killing it
 //! drops the socket, the server tears down the share, same as closing the tab.
 
@@ -164,6 +164,6 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> (std::path::PathBuf, Se
         }
     }
 
-    let path = path.unwrap_or_else(|| panic!("usage: directshare share <file> [--server host[:port]]"));
+    let path = path.unwrap_or_else(|| panic!("usage: p2p-autos share <file> [--server host[:port]]"));
     (path, parse_server(&server))
 }

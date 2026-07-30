@@ -1,4 +1,4 @@
-//! directshare — browser-held file relay, with two modes:
+//! p2p-autos — browser-held file relay, with two modes:
 //!
 //! `serve` (default, also invoked with no subcommand at all): the relay
 //! server. The uploader's tab holds the bytes; the server holds only a
@@ -8,7 +8,7 @@
 //! side. Tab closes -> socket closes -> registry entry gone -> 404.
 //!
 //! `share <file>`: a CLI client that offers one local file to a remote
-//! directshare server (playing the browser tab's role) and prints the
+//! p2p-autos server (playing the browser tab's role) and prints the
 //! download link. Link dies when the process does, same as a closed tab.
 mod client;
 mod download;
@@ -99,7 +99,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "directshare=info,tower_http=warn".into()),
+                .unwrap_or_else(|_| "p2p-autos=info,tower_http=warn".into()),
         )
         .init();
 

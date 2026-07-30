@@ -167,7 +167,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "directshare"
+name = "p2p-autos"
 version = "0.1.0"
 dependencies = [
  "axum",
