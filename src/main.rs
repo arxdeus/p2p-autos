@@ -19,7 +19,6 @@ use axum::{
     routing::{any, get},
     Router,
 };
-use dashmap::DashMap;
 
 use share::App;
 
@@ -31,8 +30,65 @@ const MAX_FRAME: usize = CHUNK as usize + 64;
 /// and grows toward this only when evidence (a starved read, see the
 /// Relay stream in download.rs) shows the pipe needs more depth to stay
 /// full. Caps RAM per transfer at MAX_WINDOW * CHUNK no matter how far it
-/// actually grows.
+/// actually grows — and see share::App::budget_chunks for how that ceiling
+/// itself shrinks under load rather than ever rejecting a download.
 const MAX_WINDOW: u32 = 4;
+/// Default `--memory-budget`, in MiB (== CHUNKs). Sized to fit a small
+/// 512 MiB box comfortably even at full tilt, with room to spare for the
+/// OS, the binary itself, and (if used) a reverse proxy in front.
+const DEFAULT_MEMORY_BUDGET_MIB: usize = 256;
+
+struct Config {
+    bind: SocketAddr,
+    memory_budget_mib: usize,
+}
+
+impl Config {
+    /// `--address <ip>` / `--port <n>` override the default bind address
+    /// and port (0.0.0.0:8080); `BIND=host:port` is the older equivalent,
+    /// used only when neither flag is given. `--memory-budget <mib>` sets
+    /// the total download-buffer budget divided live across active
+    /// downloads — see share::App::budget_chunks.
+    fn parse() -> Self {
+        let mut address: Option<String> = None;
+        let mut port: Option<u16> = None;
+        let mut memory_budget_mib = DEFAULT_MEMORY_BUDGET_MIB;
+
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--address" => {
+                    address = Some(args.next().unwrap_or_else(|| panic!("--address needs a value")));
+                }
+                "--port" => {
+                    let v = args.next().unwrap_or_else(|| panic!("--port needs a value"));
+                    port = Some(v.parse().expect("--port must be a number"));
+                }
+                "--memory-budget" => {
+                    let v = args
+                        .next()
+                        .unwrap_or_else(|| panic!("--memory-budget needs a value (MiB)"));
+                    memory_budget_mib = v.parse().expect("--memory-budget must be a number");
+                }
+                other => panic!(
+                    "unknown argument: {other} (expected --address, --port, or --memory-budget)"
+                ),
+            }
+        }
+
+        let bind = if address.is_some() || port.is_some() {
+            let address = address.unwrap_or_else(|| "0.0.0.0".into());
+            let port = port.unwrap_or(8080);
+            format!("{address}:{port}")
+        } else {
+            std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8080".into())
+        }
+        .parse()
+        .expect("invalid address/port");
+
+        Self { bind, memory_budget_mib }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -43,9 +99,8 @@ async fn main() {
         )
         .init();
 
-    let app = Arc::new(App {
-        shares: DashMap::new(),
-    });
+    let config = Config::parse();
+    let app = Arc::new(App::new(config.memory_budget_mib));
 
     let router = Router::new()
         .route("/", get(index))
@@ -53,15 +108,14 @@ async fn main() {
         .route("/d/{id}", get(download::download))
         .with_state(app);
 
-    let bind: SocketAddr = std::env::var("BIND")
-        .unwrap_or_else(|_| "0.0.0.0:8080".into())
-        .parse()
-        .expect("BIND must be host:port");
-
+    let bind = config.bind;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .unwrap_or_else(|e| panic!("bind {bind}: {e}"));
-    tracing::info!("listening on http://{bind}");
+    tracing::info!(
+        "listening on http://{bind} (memory budget: {} MiB)",
+        config.memory_budget_mib
+    );
 
     axum::serve(listener, router.into_make_service())
         .with_graceful_shutdown(shutdown_signal())

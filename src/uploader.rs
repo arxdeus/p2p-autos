@@ -8,7 +8,10 @@
 
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -47,9 +50,11 @@ const REQ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Pong) for this long is presumed dead. Unlike REQ_IDLE_TIMEOUT this is
 /// not bandwidth-sensitive — pings/pongs are a few bytes — so it can be tight.
 const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-/// Concurrent downloads one uploader tab will serve at once. Bounds memory
-/// (MAX_WINDOW * CHUNK per download) against one link being hit with many
-/// connections that never drain their body.
+/// Concurrent downloads one uploader tab will serve at once. This is an
+/// anti-abuse cap, not a memory-sizing one (that's App::budget_chunks and
+/// fair_share_window below) — it bounds how much damage one attacker who
+/// already holds a link can do by opening many connections against it and
+/// never draining them, independent of overall server load.
 const MAX_REQS_PER_CONN: usize = 32;
 
 /// Control messages from HTTP handlers to the socket task that owns a file.
@@ -101,11 +106,23 @@ struct Req {
     /// Pulls issued whose frame has not yet arrived.
     pending: u32,
     /// Current pipeline depth for this request. Starts at 1, grows toward
-    /// MAX_WINDOW on demand — see MAX_WINDOW's doc.
+    /// MAX_WINDOW on demand — see MAX_WINDOW's doc. The *effective* ceiling
+    /// pump() actually uses is this, further capped live by
+    /// fair_share_window — see that function's doc.
     window: u32,
     /// Last time a pull was answered or a chunk was consumed downstream.
     /// Swept on the ping tick; see REQ_IDLE_TIMEOUT.
     last_progress: Instant,
+    /// Shared with App. Dropping this Req decrements it, so the global
+    /// active-download count — and everyone else's fair share — is correct
+    /// the instant this download ends, however it ends.
+    active_downloads: Arc<AtomicUsize>,
+}
+
+impl Drop for Req {
+    fn drop(&mut self) {
+        self.active_downloads.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub(crate) async fn ws_upgrade(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
@@ -120,7 +137,7 @@ pub(crate) async fn ws_upgrade(State(app): State<Arc<App>>, ws: WebSocketUpgrade
 async fn host(socket: WebSocket, app: Arc<App>) {
     let (tx, mut rx) = socket.split();
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Cmd>();
-    let mut actor = Actor::new(tx);
+    let mut actor = Actor::new(tx, app);
 
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -129,7 +146,7 @@ async fn host(socket: WebSocket, app: Arc<App>) {
     loop {
         let alive = tokio::select! {
             incoming = rx.next() => match incoming {
-                Some(Ok(msg)) => actor.on_message(msg, &app, &cmd_tx).await,
+                Some(Ok(msg)) => actor.on_message(msg, &cmd_tx).await,
                 _ => Err(()),
             },
             Some(cmd) = cmd_rx.recv() => actor.on_cmd(cmd).await,
@@ -140,7 +157,7 @@ async fn host(socket: WebSocket, app: Arc<App>) {
         }
     }
 
-    actor.shutdown(&app);
+    actor.shutdown();
     // actor.reqs drops here: every sink closes, every in-flight download ends.
 }
 
@@ -152,15 +169,17 @@ struct Actor {
     ids: Vec<String>,
     reqs: HashMap<u32, Req>,
     last_seen: Instant,
+    app: Arc<App>,
 }
 
 impl Actor {
-    fn new(tx: SplitSink<WebSocket, Message>) -> Self {
+    fn new(tx: SplitSink<WebSocket, Message>, app: Arc<App>) -> Self {
         Self {
             tx,
             ids: Vec::new(),
             reqs: HashMap::new(),
             last_seen: Instant::now(),
+            app,
         }
     }
 
@@ -168,7 +187,6 @@ impl Actor {
     async fn on_message(
         &mut self,
         msg: Message,
-        app: &App,
         cmd_tx: &mpsc::UnboundedSender<Cmd>,
     ) -> Result<(), ()> {
         self.last_seen = Instant::now();
@@ -177,7 +195,7 @@ impl Actor {
                 self.on_pull_reply(buf);
                 Ok(())
             }
-            Message::Text(text) => self.on_text(&text, app, cmd_tx).await,
+            Message::Text(text) => self.on_text(&text, cmd_tx).await,
             Message::Close(_) => Err(()),
             Message::Ping(_) | Message::Pong(_) => Ok(()),
         }
@@ -215,13 +233,10 @@ impl Actor {
     async fn on_text(
         &mut self,
         text: &str,
-        app: &App,
         cmd_tx: &mpsc::UnboundedSender<Cmd>,
     ) -> Result<(), ()> {
         match serde_json::from_str::<Up>(text) {
-            Ok(Up::Offer { name, size, mime }) => {
-                self.on_offer(name, size, mime, app, cmd_tx).await
-            }
+            Ok(Up::Offer { name, size, mime }) => self.on_offer(name, size, mime, cmd_tx).await,
             Ok(Up::Err { r }) => {
                 self.reqs.remove(&r); // truncates the body; client sees a short read
                 Ok(())
@@ -235,7 +250,6 @@ impl Actor {
         name: String,
         size: u64,
         mime: String,
-        app: &App,
         cmd_tx: &mpsc::UnboundedSender<Cmd>,
     ) -> Result<(), ()> {
         if self.ids.len() >= MAX_SHARES_PER_CONN {
@@ -244,7 +258,7 @@ impl Actor {
             return send_msg(&mut self.tx, Message::Text(r#"{"t":"full"}"#.into())).await;
         }
         let id = insert_share(
-            app,
+            &self.app,
             Share {
                 name: sanitize_name(&name).into(),
                 mime: sanitize_mime(&mime).into(),
@@ -274,6 +288,7 @@ impl Actor {
                     // any other cancellation path below.
                     return Ok(());
                 }
+                self.app.active_downloads.fetch_add(1, Ordering::Relaxed);
                 self.reqs.insert(
                     req,
                     Req {
@@ -285,9 +300,10 @@ impl Actor {
                         pending: 0,
                         window: 1,
                         last_progress: Instant::now(),
+                        active_downloads: Arc::clone(&self.app.active_downloads),
                     },
                 );
-                pump(&mut self.tx, &mut self.reqs, req).await
+                self.pump(req).await
             }
             Cmd::Credit(req, starved) => {
                 if let Some(st) = self.reqs.get_mut(&req) {
@@ -297,11 +313,14 @@ impl Actor {
                         // The pipe ran dry once; one more chunk of depth
                         // earns its keep. Never shrinks back — a
                         // download's needs don't usually change
-                        // mid-transfer, and this keeps it simple.
+                        // mid-transfer, and this keeps it simple. It's
+                        // still re-divided live by fair_share_window on
+                        // every pump(), so a busy server still throttles
+                        // it down regardless of what it's grown to here.
                         st.window = (st.window + 1).min(MAX_WINDOW);
                     }
                 }
-                pump(&mut self.tx, &mut self.reqs, req).await
+                self.pump(req).await
             }
             Cmd::Close(req) => {
                 if self.reqs.remove(&req).is_none() {
@@ -312,6 +331,32 @@ impl Actor {
                 send_msg(&mut self.tx, Message::Text(msg.into())).await
             }
         }
+    }
+
+    /// Issue pulls for `req` until its effective window is full or its
+    /// range is done. The effective window is this request's own earned
+    /// depth (`Req::window`) further capped, live, by fair_share_window —
+    /// so a server-wide traffic spike throttles it down immediately, and
+    /// a spike easing off lets it immediately use more, with no separate
+    /// bookkeeping needed for either direction.
+    async fn pump(&mut self, req: u32) -> Result<(), ()> {
+        let ceiling = fair_share_window(self.app.budget_chunks, &self.app.active_downloads);
+        let Some(st) = self.reqs.get_mut(&req) else {
+            return Ok(());
+        };
+        while st.outstanding < st.window.min(ceiling) && st.next < st.end {
+            let start = st.next;
+            let end = start.saturating_add(CHUNK).min(st.end);
+            st.next = end;
+            st.outstanding += 1;
+            st.pending += 1;
+            let msg = format!(
+                r#"{{"t":"pull","r":{req},"f":"{}","s":{start},"e":{end}}}"#,
+                st.file
+            );
+            send_msg(&mut self.tx, Message::Text(msg.into())).await?;
+        }
+        Ok(())
     }
 
     /// The periodic heartbeat: declare the connection dead if it has gone
@@ -336,12 +381,27 @@ impl Actor {
 
     /// Every share this tab registered is now gone; every in-flight
     /// download against them ends when `self.reqs` drops with `self`.
-    fn shutdown(&self, app: &App) {
+    fn shutdown(&self) {
         for id in &self.ids {
-            app.shares.remove(id);
+            self.app.shares.remove(id);
             tracing::info!(%id, "share closed");
         }
     }
+}
+
+/// This request's fair share of the server's memory budget right now: the
+/// budget divided evenly across every currently-active download, clamped
+/// to at least 1 (every download gets to make *some* progress — nothing
+/// is ever rejected for this) and at most MAX_WINDOW (no request grows
+/// past what a single download could ever usefully hold anyway).
+///
+/// Recomputed fresh on every pump() call, so it tracks load in both
+/// directions: more concurrent downloads shrinks everyone's share
+/// immediately, and fewer grows it back just as fast — no separate
+/// bookkeeping, no timers, no rejected requests, just live division.
+fn fair_share_window(budget_chunks: usize, active_downloads: &AtomicUsize) -> u32 {
+    let active = active_downloads.load(Ordering::Relaxed).max(1);
+    (budget_chunks / active).clamp(1, MAX_WINDOW as usize) as u32
 }
 
 /// Send one WebSocket frame with a hard deadline. `select!` in `host` only
@@ -353,28 +413,4 @@ async fn send_msg(tx: &mut SplitSink<WebSocket, Message>, msg: Message) -> Resul
         Ok(Ok(())) => Ok(()),
         _ => Err(()),
     }
-}
-
-/// Issue pulls until this request's current window is full or the range is done.
-async fn pump(
-    tx: &mut SplitSink<WebSocket, Message>,
-    reqs: &mut HashMap<u32, Req>,
-    req: u32,
-) -> Result<(), ()> {
-    let Some(st) = reqs.get_mut(&req) else {
-        return Ok(());
-    };
-    while st.outstanding < st.window && st.next < st.end {
-        let start = st.next;
-        let end = start.saturating_add(CHUNK).min(st.end);
-        st.next = end;
-        st.outstanding += 1;
-        st.pending += 1;
-        let msg = format!(
-            r#"{{"t":"pull","r":{req},"f":"{}","s":{start},"e":{end}}}"#,
-            st.file
-        );
-        send_msg(tx, Message::Text(msg.into())).await?;
-    }
-    Ok(())
 }

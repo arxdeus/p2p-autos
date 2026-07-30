@@ -1,6 +1,6 @@
 //! The share registry: files an uploader tab has offered, keyed by a short id.
 
-use std::sync::Arc;
+use std::sync::{atomic::AtomicUsize, Arc};
 
 use dashmap::DashMap;
 use rand::Rng;
@@ -22,6 +22,28 @@ pub(crate) struct Share {
 
 pub(crate) struct App {
     pub(crate) shares: DashMap<String, Share>,
+    /// Target total memory, in CHUNKs (== MiB, since CHUNK is exactly
+    /// 1 MiB), for every download's buffer combined — across every share
+    /// and every uploader tab. Never used to reject a download: pump()
+    /// divides it live across however many downloads are active right
+    /// now (see fair_share_window in uploader.rs), so more concurrent
+    /// downloads means a smaller window each, automatically, not a cutoff.
+    pub(crate) budget_chunks: usize,
+    /// How many downloads are active right now, across every uploader tab.
+    /// Incremented when a Req is created, decremented (via Req's Drop) the
+    /// instant one ends, whatever the reason — so fair_share_window always
+    /// divides by the true current count.
+    pub(crate) active_downloads: Arc<AtomicUsize>,
+}
+
+impl App {
+    pub(crate) fn new(budget_chunks: usize) -> Self {
+        Self {
+            shares: DashMap::new(),
+            budget_chunks,
+            active_downloads: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 /// Registers `share` under a fresh id, retrying on the (astronomically
