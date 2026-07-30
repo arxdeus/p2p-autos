@@ -1,0 +1,30 @@
+[package]
+name = "directshare"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "signal",
+  "time",
+] }
+futures-util = { version = "0.3", default-features = false, features = [
+  "sink",
+] }
+dashmap = "6"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

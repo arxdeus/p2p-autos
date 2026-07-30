@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>directshare</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b0d10;
+        --fg: #e7e9ee;
+        --dim: #8b93a1;
+        --line: #252a33;
+        --ok: #5ee6a8;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100dvh;
+        display: grid;
+        place-items: center;
+        gap: 2rem;
+        background: var(--bg);
+        color: var(--fg);
+        font:
+          15px/1.5 ui-sans-serif,
+          system-ui,
+          sans-serif;
+        padding: 2rem;
+      }
+      main {
+        width: min(560px, 100%);
+      }
+      h1 {
+        font-size: 1.1rem;
+        font-weight: 600;
+        margin: 0 0 0.25rem;
+        letter-spacing: -0.01em;
+      }
+      p.sub {
+        margin: 0 0 1.5rem;
+        color: var(--dim);
+        font-size: 0.875rem;
+      }
+      #drop {
+        border: 1.5px dashed var(--line);
+        border-radius: 12px;
+        padding: 3rem 1.5rem;
+        text-align: center;
+        cursor: pointer;
+        transition:
+          border-color 0.15s,
+          background 0.15s;
+      }
+      #drop:hover,
+      #drop.hot {
+        border-color: var(--ok);
+        background: #5ee6a80d;
+      }
+      #drop strong {
+        display: block;
+        font-weight: 500;
+      }
+      #drop span {
+        color: var(--dim);
+        font-size: 0.8125rem;
+      }
+      ul {
+        list-style: none;
+        margin: 1.5rem 0 0;
+        padding: 0;
+        display: grid;
+        gap: 0.5rem;
+      }
+      li {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 0.75rem 0.875rem;
+        display: grid;
+        gap: 0.375rem;
+      }
+      .name {
+        font-size: 0.8125rem;
+        color: var(--dim);
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+      }
+      .name b {
+        font-weight: 500;
+        color: var(--fg);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .link {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+      }
+      input.url {
+        flex: 1;
+        min-width: 0;
+        background: #000;
+        border: 1px solid var(--line);
+        color: var(--ok);
+        border-radius: 7px;
+        padding: 0.5rem 0.625rem;
+        font:
+          13px ui-monospace,
+          monospace;
+      }
+      button {
+        background: var(--line);
+        border: 0;
+        color: var(--fg);
+        border-radius: 7px;
+        padding: 0.5rem 0.75rem;
+        font-size: 0.8125rem;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #333a46;
+      }
+      footer {
+        color: var(--dim);
+        font-size: 0.8125rem;
+        text-align: center;
+      }
+      #err {
+        color: #ff8b8b;
+        min-height: 1.5rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>directshare</h1>
+      <p class="sub">
+        Files never touch disk here. They stream from this tab, to whoever holds
+        the link.
+      </p>
+
+      <div
+        id="drop"
+        tabindex="0"
+        role="button"
+        aria-label="Choose a file to share"
+      >
+        <strong>Drop a file</strong>
+        <span>or click to choose</span>
+      </div>
+      <input id="picker" type="file" multiple hidden />
+      <ul id="list"></ul>
+      <p id="err" role="status"></p>
+    </main>
+    <footer>Keep this tab open. Close it and every link 404s.</footer>
+
+    <template id="row">
+      <li>
+        <div class="name"><b></b><span></span></div>
+        <div class="link">
+          <input class="url" readonly aria-label="Direct link" /><button>
+            Copy
+          </button>
+        </div>
+      </li>
+    </template>
+
+    <script>
+      const $ = (s) => document.querySelector(s);
+      const drop = $("#drop"),
+        picker = $("#picker"),
+        list = $("#list"),
+        err = $("#err"),
+        row = $("#row");
+
+      const files = new Map(); // share id -> File
+      const tails = new Map(); // request id -> promise chain, keeps chunks in order
+      const dead = new Set(); // cancelled request ids
+      let awaiting = []; // Files offered, waiting for their id, in send order
+      let queued = []; // Files chosen before the socket opened
+
+      const ws = new WebSocket(location.origin.replace(/^http/, "ws") + "/ws");
+      ws.onopen = () => {
+        queued.forEach(offer);
+        queued = [];
+      };
+      ws.onclose = () => {
+        err.textContent = "Disconnected — reload to share again.";
+      };
+
+      ws.onmessage = (ev) => {
+        let m;
+        try {
+          m = JSON.parse(ev.data);
+        } catch {
+          return;
+        }
+        if (m.t === "pull") queue(m);
+        else if (m.t === "ready") {
+          files.set(m.id, awaiting.shift());
+          show(m.id);
+        } else if (m.t === "cancel") {
+          dead.add(m.r);
+          tails.delete(m.r);
+        } else if (m.t === "full") {
+          awaiting.shift();
+          err.textContent = "Too many files in one tab.";
+        }
+      };
+
+      // The server keeps several pulls in flight per request. Reads resolve out of
+      // order, so chain them: one request's chunks always ship in sequence.
+      function queue(m) {
+        tails.set(
+          m.r,
+          (tails.get(m.r) || Promise.resolve())
+            .then(() => send(m))
+            .catch(() => {}),
+        );
+      }
+
+      async function send({ r, f, s, e }) {
+        const file = files.get(f);
+        if (!file || dead.has(r)) return;
+        let body;
+        try {
+          body = await file.slice(s, e).arrayBuffer();
+        } catch {
+          // File moved, renamed, or the drive went away mid-transfer.
+          dead.add(r);
+          if (ws.readyState === 1) ws.send(JSON.stringify({ t: "err", r }));
+          return;
+        }
+        if (dead.has(r) || ws.readyState !== 1) return;
+        const frame = new Uint8Array(4 + body.byteLength);
+        new DataView(frame.buffer).setUint32(0, r, true);
+        frame.set(new Uint8Array(body), 4);
+        ws.send(frame);
+      }
+
+      // Offers are answered in the order they were sent, so a queue is enough.
+      function offer(file) {
+        awaiting.push(file);
+        ws.send(
+          JSON.stringify({
+            t: "offer",
+            name: file.name,
+            size: file.size,
+            mime: file.type,
+          }),
+        );
+      }
+
+      function show(id) {
+        const file = files.get(id);
+        if (!file) return;
+        const url = location.origin + "/d/" + id;
+        const li = row.content.cloneNode(true).firstElementChild;
+        li.querySelector("b").textContent = file.name;
+        li.querySelector("span").textContent = size(file.size);
+        li.querySelector("input").value = url;
+        li.querySelector("button").onclick = async (ev) => {
+          try {
+            await navigator.clipboard.writeText(url);
+          } catch {
+            li.querySelector("input").select();
+          }
+          ev.target.textContent = "Copied";
+          setTimeout(() => {
+            ev.target.textContent = "Copy";
+          }, 1200);
+        };
+        list.append(li);
+      }
+
+      const size = (n) => {
+        const u = ["B", "KB", "MB", "GB", "TB"];
+        let i = 0;
+        while (n >= 1024 && i < u.length - 1) {
+          n /= 1024;
+          i++;
+        }
+        return (i ? n.toFixed(1) : n) + " " + u[i];
+      };
+
+      function take(chosen) {
+        err.textContent = "";
+        for (const f of chosen) ws.readyState === 1 ? offer(f) : queued.push(f);
+      }
+
+      drop.onclick = () => picker.click();
+      drop.onkeydown = (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          picker.click();
+        }
+      };
+      picker.onchange = () => {
+        take(picker.files);
+        picker.value = "";
+      };
+      drop.ondragover = (e) => {
+        e.preventDefault();
+        drop.classList.add("hot");
+      };
+      drop.ondragleave = () => drop.classList.remove("hot");
+      drop.ondrop = (e) => {
+        e.preventDefault();
+        drop.classList.remove("hot");
+        take(e.dataTransfer.files);
+      };
+      addEventListener("dragover", (e) => e.preventDefault());
+      addEventListener("drop", (e) => e.preventDefault());
+    </script>
+  </body>
+</html>
