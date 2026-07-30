@@ -11,6 +11,9 @@ tokio = { version = "1", features = [
   "net",
   "signal",
   "time",
+  "sync",
+  "fs",
+  "io-util",
 ] }
 futures-util = { version = "0.3", default-features = false, features = [
   "sink",
@@ -22,6 +25,7 @@ serde_json = "1"
 rand = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-tungstenite = "0.24"
 
 [profile.release]
 lto = "fat"

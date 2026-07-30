@@ -1,11 +1,16 @@
-//! directshare — browser-held file relay.
+//! directshare — browser-held file relay, with two modes:
 //!
-//! The uploader's tab holds the bytes. The server holds only a routing table.
-//! A download pulls chunks over the uploader's WebSocket and streams them out
-//! as a plain HTTP body, so any client (curl, wget, a browser, a video player)
-//! can use the link with no JS on the consumer side.
+//! `serve` (default, also invoked with no subcommand at all): the relay
+//! server. The uploader's tab holds the bytes; the server holds only a
+//! routing table. A download pulls chunks over the uploader's WebSocket
+//! and streams them out as a plain HTTP body, so any client (curl, wget,
+//! a browser, a video player) can use the link with no JS on the consumer
+//! side. Tab closes -> socket closes -> registry entry gone -> 404.
 //!
-//! Tab closes -> socket closes -> registry entry gone -> 404.
+//! `share <file>`: a CLI client that offers one local file to a remote
+//! directshare server (playing the browser tab's role) and prints the
+//! download link. Link dies when the process does, same as a closed tab.
+mod client;
 mod download;
 mod sanitize;
 mod share;
@@ -49,12 +54,11 @@ impl Config {
     /// used only when neither flag is given. `--memory-budget <mib>` sets
     /// the total download-buffer budget divided live across active
     /// downloads — see share::App::budget_chunks.
-    fn parse() -> Self {
+    fn parse(mut args: impl Iterator<Item = String>) -> Self {
         let mut address: Option<String> = None;
         let mut port: Option<u16> = None;
         let mut memory_budget_mib = DEFAULT_MEMORY_BUDGET_MIB;
 
-        let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--address" => {
@@ -99,7 +103,16 @@ async fn main() {
         )
         .init();
 
-    let config = Config::parse();
+    let mut args = std::env::args().skip(1).peekable();
+    if args.peek().map(String::as_str) == Some("share") {
+        args.next();
+        return client::run(args).await;
+    }
+    if args.peek().map(String::as_str) == Some("serve") {
+        args.next();
+    }
+
+    let config = Config::parse(args);
     let app = Arc::new(App::new(config.memory_budget_mib));
 
     let router = Router::new()
